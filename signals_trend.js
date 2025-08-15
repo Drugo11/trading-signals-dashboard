@@ -1,0 +1,1 @@
+const signals_trend = [];
