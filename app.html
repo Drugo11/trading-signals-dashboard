@@ -76,10 +76,17 @@
     <!-- Load precomputed signals data.  This script defines a global variable `signalsData`. -->
     <script src="signals.js"></script>
     <script>
-      // If signalsData is already defined via signals.js, use it directly; otherwise attempt to fetch from signals.json.
-      let loadedSignals = Array.isArray(typeof signalsData !== 'undefined' ? signalsData : [])
-        ? signalsData
-        : [];
+      // Determine which global variable contains the precomputed signals.  Prefer `signalsData` if
+      // defined and an array, but fall back to `signals` if available.  If neither exists,
+      // initialize an empty array and attempt to fetch from `signals.json` later.
+      let loadedSignals;
+      if (typeof signalsData !== 'undefined' && Array.isArray(signalsData)) {
+        loadedSignals = signalsData;
+      } else if (typeof signals !== 'undefined' && Array.isArray(signals)) {
+        loadedSignals = signals;
+      } else {
+        loadedSignals = [];
+      }
 
       async function fetchSignals() {
         // If signals are preloaded, skip fetching
