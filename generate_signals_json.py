@@ -130,6 +130,7 @@ def main(
         horizon=horizon,
         n_splits=n_splits,
         quantile=quantile,
+        include_macro=True,
     )
     signals = classify_signals(result.raw_predictions[["Date", "Ticker", "pred"]], quantile)
     # Write JSON
