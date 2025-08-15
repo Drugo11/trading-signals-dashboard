@@ -72,6 +72,13 @@ except ImportError:  # pragma: no cover
         " install the `xgboost` package."
     )
 
+# Attempt to import pandas_datareader for macro data.  If unavailable, we'll fall back
+# to synthetic macro series later.  Use alias pdr to avoid confusion with pd.
+try:
+    from pandas_datareader import data as pdr  # type: ignore
+except ImportError:  # pragma: no cover
+    pdr = None  # type: ignore
+
 
 def fetch_price_data(
     tickers: Iterable[str],
@@ -158,17 +165,81 @@ def fetch_price_data(
     return synthetic_df
 
 
-def build_dataset(
-    price_df: pd.DataFrame, horizon: int = 5
-) -> Tuple[pd.DataFrame, List[str]]:
-    """Construct a long‑form data set with features and future returns.
+def fetch_macro_data(
+    start: str = "2018-01-01",
+    end: Optional[str] = None,
+    series: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    """Fetch macroeconomic time series from FRED or generate synthetic data.
 
-    For each ticker, a set of technical features is computed.  The
-    features are then combined into a MultiIndex DataFrame with top
-    level representing the feature name and second level the ticker.  The
-    result is reshaped into a long format suitable for cross‑sectional
-    learning: columns include 'Date', 'Ticker', feature values and
-    'y' (the forward return over the specified horizon).
+    This helper retrieves daily (or lower frequency) macro variables from the
+    Federal Reserve's FRED database via ``pandas_datareader``.  If fetching
+    fails or the library is unavailable, it generates synthetic random
+    series so the rest of the pipeline can run without external
+    dependencies.
+
+    Parameters
+    ----------
+    start : str
+        Start date for the macro series, as an ISO format string.
+    end : str, optional
+        End date for the macro series.  If None, uses the current date.
+    series : Dict[str, str], optional
+        Mapping from FRED series codes to column names to use in the
+        returned DataFrame.  A default mapping is used if this is None.
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame indexed by business date with columns corresponding
+        to macro variables.  Missing values are forward‑filled.  When
+        synthetic data is generated, a random walk is used.
+    """
+    # Default FRED series mapping
+    if series is None:
+        series = {
+            "FEDFUNDS": "fed_funds",
+            "CPIAUCSL": "cpi",
+            "UNRATE": "unemployment",
+        }
+    end_ts = pd.Timestamp(end) if end else pd.Timestamp.today().normalize()
+    try:
+        if pdr is not None:
+            frames = []
+            for code, name in series.items():
+                df = pdr.DataReader(code, "fred", start, end_ts)
+                df = df.rename(columns={code: name})
+                frames.append(df)
+            macro_df = pd.concat(frames, axis=1)
+            macro_df = macro_df.sort_index().ffill()
+            return macro_df
+    except Exception:
+        # proceed to synthetic fallback
+        pass
+    # Synthetic fallback
+    date_range = pd.bdate_range(start=start, end=end_ts)
+    rng = np.random.default_rng(42)
+    macro_df = pd.DataFrame(index=date_range)
+    for _, name in series.items():
+        noise = rng.normal(0, 0.02, len(date_range))
+        macro_df[name] = np.cumsum(noise)
+    return macro_df
+
+
+def build_dataset(
+    price_df: pd.DataFrame,
+    horizon: int = 5,
+    macro_df: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Construct a long‑form data set with features, future returns and optional macro data.
+
+    For each ticker, a set of technical features is computed.  These
+    features are combined into a MultiIndex DataFrame with a top level
+    representing the feature name and a second level for the ticker.
+    The result is reshaped into a long format suitable for
+    cross‑sectional learning: columns include 'Date', 'Ticker', feature
+    values, optional macro variables and 'y' (the forward return over
+    the specified horizon).
 
     Parameters
     ----------
@@ -178,46 +249,46 @@ def build_dataset(
     horizon : int, optional
         Number of business days over which to compute future returns,
         by default 5.
+    macro_df : pd.DataFrame, optional
+        DataFrame of macroeconomic features indexed by date.  Columns
+        represent different macro variables.  These columns will be
+        merged onto the long‑format data and treated as additional
+        features.  If ``None``, no macro data is used.
 
     Returns
     -------
     Tuple[pd.DataFrame, List[str]]
         A tuple containing the long‑format DataFrame and a list of
-        feature column names.  The DataFrame has columns ['Date',
-        'Ticker', *features, 'y'].
+        feature column names (including macro names if provided).  The
+        DataFrame has columns ['Date', 'Ticker', *features, 'y'].
     """
-    # Basic features: momentum over 5 and 20 days, volatility over 20
+    # Technical features: momentum over 5 and 20 days, volatility over 20
     # days, relative volatility (20d / 60d)
     returns = price_df.pct_change()
-    # Create a dict of DataFrames keyed by feature name
     feature_dict: Dict[str, pd.DataFrame] = {
         "mom_5": price_df.pct_change(5),
         "mom_20": price_df.pct_change(20),
         "vol_20": returns.rolling(20).std(),
         "rvol": returns.rolling(20).std() / returns.rolling(60).std(),
     }
-    # Concatenate along axis=1, forming a multiindex (feature, ticker)
     feat = pd.concat(feature_dict, axis=1)
-    # Target: horizon‑ahead return
     target = price_df.shift(-horizon).pct_change(horizon)
-    # Drop rows with missing values (from rolling calculations)
-    # Stack the data along the ticker axis.  The resulting index levels
-    # correspond to (Date, Ticker).  Resetting the index converts
-    # these levels into columns named 'level_0' and 'level_1'.
     df = feat.dropna().stack(level=1).reset_index()
-    # Rename the index columns to Date and Ticker
     df = df.rename(columns={"level_0": "Date", "level_1": "Ticker"})
-    # Flatten hierarchical feature names (feature -> value)
     feature_cols: List[str] = list(feature_dict.keys())
-    # Merge target
-    # Stack the target to align with (Date, Ticker) pairs.  The resulting
-    # DataFrame has columns: level_0 (date index), level_1 (ticker), 0 (value)
     tgt = target.stack().reset_index()
-    # Rename columns to descriptive names
     tgt = tgt.rename(columns={"level_0": "Date", "level_1": "Ticker", 0: "y"})
-    # Merge features with target on Date and Ticker
     df = df.merge(tgt, on=["Date", "Ticker"], how="inner")
-    # After merging, ensure there are no remaining NaNs
+    # Include macro features if provided
+    if macro_df is not None and not macro_df.empty:
+        macro_df_local = macro_df.copy()
+        macro_df_local.index.name = "Date"
+        macro_df_local = macro_df_local.sort_index().reset_index()
+        macro_df_local = macro_df_local.ffill()
+        df = df.merge(macro_df_local, on="Date", how="left")
+        macro_cols = [c for c in macro_df_local.columns if c != "Date"]
+        df = df.dropna(subset=macro_cols)
+        feature_cols.extend(macro_cols)
     df = df.dropna(subset=["y"] + feature_cols)
     return df, feature_cols
 
@@ -275,6 +346,8 @@ def run_backtest(
     subsample: float = 0.7,
     colsample_bytree: float = 0.7,
     random_state: int = 42,
+    include_macro: bool = True,
+    macro_series: Optional[Dict[str, str]] = None,
 ) -> BacktestResult:
     """Execute the full pipeline and return backtest results.
 
@@ -319,8 +392,15 @@ def run_backtest(
         )
     # 1. Fetch price data
     price_df = fetch_price_data(tickers, start=start, end=end)
-    # 2. Build dataset
-    df, feature_cols = build_dataset(price_df, horizon=horizon)
+    # 2. Optionally fetch macroeconomic data
+    macro_df = None
+    if include_macro:
+        try:
+            macro_df = fetch_macro_data(start=start, end=end, series=macro_series)
+        except Exception:
+            macro_df = None
+    # 3. Build dataset including macro features
+    df, feature_cols = build_dataset(price_df, horizon=horizon, macro_df=macro_df)
     # Sort by date for reproducibility
     df = df.sort_values("Date").reset_index(drop=True)
     # Prepare container for predictions
