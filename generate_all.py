@@ -1,99 +1,225 @@
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from datetime import datetime, timedelta
-import json
+"""
+Script to generate trading signals and performance for multiple strategies.
+
+This script produces the following artefacts:
+
+* `signals_trend.js` – JavaScript file defining the constant `signals_trend` with
+  a list of daily signals for a simple trend‑following strategy on a basket of
+  exchange‑traded funds (ETFs).  Each entry contains the date, ticker,
+  prediction (percent difference between the price and its 200‑day moving
+  average) and the position signal (1 for long, 0 for flat).  A regime
+  filter based on the variance risk premium (VRP) can down‑weight signals
+  when the market environment is unfavourable.
+
+* `signals_xsmom.js` – JavaScript file defining the constant `signals_xsmom`
+  with a list of daily signals for a cross‑sectional momentum strategy on a
+  universe of large‑cap stocks.  The prediction is the 12‑month minus
+  1‑month return; the signal is +1 for the top 20 % of predictions,
+  −1 for the bottom 20 % and 0 otherwise.  The same VRP filter can
+  down‑weight these signals.
+
+* `reports/perf_summary.csv` – A CSV summarising the annualised return
+  (CAGR), volatility, Sharpe ratio and maximum drawdown of each strategy.
+
+* `reports/equity_trend.csv` and `reports/equity_xsmom.csv` – The equity
+  curves for each strategy, i.e. the cumulative wealth from investing one
+  unit of capital using equal weighting across signals.  Each file has a
+  single column `equity` indexed by date.
+
+* `reports/daily_returns_trend.csv` and `reports/daily_returns_xsmom.csv` –
+  Daily realised returns for the corresponding strategies.
+
+The script also calls the existing `generate_signals_json.py` to update
+the machine‑learning signals (`signals.js`) so that all three sets of
+signals are refreshed together.
+
+To execute the script manually run:
+
+    python generate_all_new.py
+
+It requires the `yfinance`, `pandas` and `numpy` packages to be installed.
+"""
+
 import os
+from datetime import datetime, timedelta
+from typing import Dict, Iterable, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import json
 import subprocess
 
 
-def generate_ml_signals():
-    """Call the existing generate_signals_json script to update signals.js for ML signals."""
+def generate_ml_signals() -> None:
+    """Run the existing ML signal generator to refresh signals.js.
+
+    This function invokes `generate_signals_json.py` via subprocess.  It
+    expects that script to reside in the current working directory and
+    produce/up‑date `signals.js` when executed.  Any exceptions are caught
+    and printed so as not to interrupt the remainder of the pipeline.
+    """
     try:
-        # Run the script using subprocess. It will create/update signals.js
         subprocess.run(["python", "generate_signals_json.py"], check=True)
     except Exception as exc:
         print("Error generating ML signals:", exc)
 
 
-def generate_trend_signals(tickers, start, end):
-    """Generate trend-following signals based on price vs. a 200-day moving average.
+def _download_prices(tickers: Iterable[str], start: datetime, end: datetime) -> pd.DataFrame:
+    """Download adjusted closing prices for multiple tickers.
 
-    For each date and ticker, compute the percent difference between the price and
-    its 200-day moving average as a prediction. Generate a long signal (1) if
-    the price is above the moving average and 0 otherwise. No short signals
-    are generated for this simple trend strategy.
+    yfinance returns a DataFrame with a column per ticker when
+    `auto_adjust=True` and `progress=False`.  If a single ticker is
+    requested the returned object is a Series, so we wrap that back into a
+    DataFrame for consistency.
 
     Args:
-        tickers: List of tickers to process.
-        start: Start date for historical data.
-        end: End date for historical data.
+        tickers: Iterable of ticker symbols.
+        start: Start date (inclusive).
+        end: End date (exclusive).
 
     Returns:
-        List of dictionaries with keys date, ticker, prediction, and signal.
+        DataFrame of adjusted closing prices indexed by date with
+        tickers as columns.
     """
-    data = yf.download(tickers, start=start, end=end, progress=False)["Adj Close"]
-    sma = data.rolling(window=200).mean()
-    signals = []
-    for date in data.index:
+    data = yf.download(
+        tickers=" ".join(tickers),
+        start=start,
+        end=end,
+        auto_adjust=True,
+        progress=False,
+    )
+    if isinstance(data, pd.DataFrame):
+        if "Close" in data.columns:
+            return data["Close"].copy()
+        else:
+            return data.copy()
+    else:
+        return data.to_frame(name=list(tickers)[0])
+
+
+def compute_vrp(start: datetime, end: datetime) -> pd.Series:
+    """Compute the variance risk premium (VRP) time series.
+
+    The VRP is calculated as the difference between the square of the VIX
+    (implied variance) divided by 100 and the realised variance of the SPY
+    over a 20‑day rolling window.  It is annualised to be comparable and
+    aligned with the one‑month horizon of VIX.
+
+    Args:
+        start: Start date for the VRP (inclusive).
+        end: End date for the VRP (exclusive).
+
+    Returns:
+        A Series indexed by date with the VRP value.  Positive values
+        indicate periods where implied volatility exceeds realised volatility.
+    """
+    extended_start = start - timedelta(days=60)
+    vix = _download_prices(["^VIX"], extended_start, end).iloc[:, 0]
+    spy = _download_prices(["SPY"], extended_start, end).iloc[:, 0]
+    realised_var = spy.pct_change().rolling(window=20).std() ** 2 * 252
+    implied_var = (vix / 100) ** 2
+    vrp = implied_var - realised_var
+    vrp = vrp.loc[start: end - timedelta(days=1)]
+    return vrp
+
+
+def generate_trend_signals(
+    tickers: List[str], start: datetime, end: datetime, vrp: pd.Series
+) -> List[Dict[str, object]]:
+    """Generate simple trend‑following signals.
+
+    The prediction is the percent difference between the price and its
+    200‑day moving average.  A long signal (1) is issued when the price
+    exceeds its moving average.  There are no short signals in this
+    strategy.  Signals and predictions are optionally down‑weighted to
+    50 % when the VRP is negative, indicating stressed market conditions.
+
+    Args:
+        tickers: List of ticker symbols.
+        start: Start date for historical data (inclusive).
+        end: End date for data (exclusive).
+        vrp: Variance risk premium time series to apply regime filter.
+
+    Returns:
+        List of dictionaries with keys `date`, `ticker`, `prediction` and
+        `signal`.
+    """
+    prices = _download_prices(tickers, start, end)
+    sma200 = prices.rolling(window=200).mean()
+    signals: List[Dict[str, object]] = []
+    for date in prices.index:
+        g = 1.0
+        if date in vrp.index and vrp.loc[date] < 0:
+            g = 0.5
         dt_str = date.strftime("%Y-%m-%d")
         for ticker in tickers:
-            price = data.loc[date, ticker]
-            ma = sma.loc[date, ticker]
-            # Skip if we don't have enough history for the moving average
+            price = prices.at[date, ticker]
+            ma = sma200.at[date, ticker]
             if pd.isna(price) or pd.isna(ma):
                 continue
             pred = (price / ma) - 1.0
             sig = 1 if price > ma else 0
+            pred *= g
+            sig = int(sig * g)
             signals.append(
                 {
                     "date": dt_str,
                     "ticker": ticker,
                     "prediction": float(pred),
-                    "signal": int(sig),
+                    "signal": sig,
                 }
             )
     return signals
 
 
-def generate_xsmom_signals(tickers, start, end):
-    """Generate cross-sectional momentum signals using 12-month minus 1-month returns.
+def generate_xsmom_signals(
+    tickers: List[str], start: datetime, end: datetime, vrp: pd.Series
+) -> List[Dict[str, object]]:
+    """Generate cross‑sectional momentum signals.
 
-    Momentum is calculated daily as (12m return – 1m return). On each date, all
-    available tickers are ranked by this value. Signals are assigned as
-    follows: long (1) for the top 20% of tickers by momentum, short (‑1)
-    for the bottom 20%, and 0 for the middle 60%.
+    The prediction is defined as the 12‑month return minus the 1‑month
+    return.  For each date the universe is ranked by this prediction
+    value; the top 20 % receive a long signal (+1), the bottom 20 % a
+    short signal (−1) and the remainder 0.  Signals and predictions are
+    down‑weighted by 50 % when the VRP is negative.
 
     Args:
-        tickers: List of tickers to process.
-        start: Start date for historical data.
-        end: End date for historical data.
+        tickers: List of ticker symbols.
+        start: Start date (inclusive).
+        end: End date (exclusive).
+        vrp: Variance risk premium time series for regime filtering.
 
     Returns:
-        List of dictionaries with keys date, ticker, prediction, and signal.
+        List of dictionaries with keys `date`, `ticker`, `prediction` and
+        `signal`.
     """
-    data = yf.download(tickers, start=start, end=end, progress=False)["Adj Close"]
-    # Calculate 12-month and 1-month returns using trading days (~252 and 21 days)
-    mom12 = data / data.shift(252) - 1.0
-    mom1 = data / data.shift(21) - 1.0
-    momentum = mom12 - mom1
-    signals = []
-    for date in momentum.index:
-        dt_str = date.strftime("%Y-%m-%d")
-        row = momentum.loc[date].dropna()
-        if row.empty:
+    extended_start = start - timedelta(days=365)
+    prices = _download_prices(tickers, extended_start, end)
+    mom12 = prices.pct_change(252)
+    mom01 = prices.pct_change(21)
+    momentum = mom12 - mom01
+    signals: List[Dict[str, object]] = []
+    for date in momentum.loc[start:end - timedelta(days=1)].index:
+        preds = momentum.loc[date].dropna()
+        if preds.empty:
             continue
-        q80 = row.quantile(0.8)
-        q20 = row.quantile(0.2)
-        for ticker in tickers:
-            value = momentum.at[date, ticker]
-            if pd.isna(value):
-                continue
-            pred = float(value)
-            if value >= q80:
-                sig = 1
-            elif value <= q20:
-                sig = -1
+        g = 1.0
+        if date in vrp.index and vrp.loc[date] < 0:
+            g = 0.5
+        sorted_preds = preds.sort_values()
+        n = len(sorted_preds)
+        top_k = max(int(np.ceil(n * 0.2)), 1)
+        bottom_k = max(int(np.ceil(n * 0.2)), 1)
+        top_tickers = sorted_preds.index[-top_k:]
+        bottom_tickers = sorted_preds.index[:bottom_k]
+        dt_str = date.strftime("%Y-%m-%d")
+        for ticker in preds.index:
+            pred = float(preds[ticker]) * g
+            if ticker in top_tickers:
+                sig = int(1 * g)
+            elif ticker in bottom_tickers:
+                sig = int(-1 * g)
             else:
                 sig = 0
             signals.append(
@@ -101,188 +227,88 @@ def generate_xsmom_signals(tickers, start, end):
                     "date": dt_str,
                     "ticker": ticker,
                     "prediction": pred,
-                    "signal": int(sig),
+                    "signal": sig,
                 }
             )
     return signals
 
 
-def save_js(filename: str, var_name: str, data_list):
-    """Save a list of dictionaries to a JavaScript file.
-
-    The file will define a single variable with the given name and assign the
-    provided data list to it. This makes it easy to load the data in a
-    browser environment.
-    """
-    with open(filename, "w") as f:
-        f.write(f"const {var_name} = ")
-        json.dump(data_list, f)
-        f.write(";")
+def save_js(data: List[Dict[str, object]], var_name: str, file_path: str) -> None:
+    json_str = json.dumps(data)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(f"const {var_name} = {json_str};\n")
 
 
-def compute_performance(signals, data):
-    """Compute daily strategy returns given signals and price data.
-
-    For each date, actual returns are computed from price data and then
-    multiplied by the corresponding signals. The daily strategy return is the
-    average of these position returns. When no signals are present for a date
-    the date is skipped.
-    """
-    returns = data.pct_change().dropna()
-    records = []
-    for date in returns.index:
-        dt_str = date.strftime("%Y-%m-%d")
-        # collect signals for this date
-        day_signals = [s for s in signals if s["date"] == dt_str]
-        if not day_signals:
-            continue
-        rets = []
-        for s in day_signals:
-            ticker = s["ticker"]
-            sig = s["signal"]
-            if sig == 0:
-                continue
-            if ticker not in returns.columns:
-                continue
-            r = returns.loc[date, ticker]
-            if pd.isna(r):
-                continue
-            rets.append(sig * r)
-        if rets:
-            day_ret = float(np.mean(rets))
-            records.append({"date": dt_str, "return": day_ret})
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df.set_index("date", inplace=True)
-    return df
+def compute_performance(signals: List[Dict[str, object]]) -> Dict[str, object]:
+    df = pd.DataFrame(signals)
+    df["date"] = pd.to_datetime(df["date"])
+    signal_matrix = df.pivot_table(index="date", columns="ticker", values="signal", fill_value=0)
+    tickers = signal_matrix.columns.tolist()
+    price_start = signal_matrix.index.min()
+    price_end = signal_matrix.index.max() + timedelta(days=2)
+    prices = _download_prices(tickers, price_start, price_end)
+    returns = prices.pct_change().shift(-1)
+    aligned_returns = returns.reindex(signal_matrix.index)
+    daily_ret = (signal_matrix * aligned_returns).mean(axis=1)
+    daily_ret = daily_ret.dropna()
+    equity = (1 + daily_ret).cumprod()
+    n_days = len(equity)
+    cagr = equity.iloc[-1] ** (252 / n_days) - 1 if n_days > 0 else 0.0
+    vol = daily_ret.std() * np.sqrt(252) if not daily_ret.empty else 0.0
+    sharpe = (cagr / vol) if vol != 0 else 0.0
+    max_dd = (equity / equity.cummax() - 1).min() if not equity.empty else 0.0
+    return {
+        "equity_curve": equity,
+        "daily_returns": daily_ret,
+        "CAGR": cagr,
+        "Volatility": vol,
+        "Sharpe": sharpe,
+        "MaxDD": max_dd,
+    }
 
 
-def save_performance_report(trend_returns: pd.DataFrame, xsmom_returns: pd.DataFrame):
-    """Save a summary CSV and equity curves for the strategies.
-
-    A summary CSV containing CAGR, volatility, Sharpe ratio and maximum
-    drawdown is written to ``reports/perf_summary.csv``. Daily equity curves
-    for each strategy are stored in ``reports/equity_trend.csv`` and
-    ``reports/equity_xsmom.csv``.
-    """
-    def calc_metrics(df):
-        if df.empty:
-            return 0.0, 0.0, 0.0, 0.0
-        cum = (1 + df["return"]).cumprod()
-        total_days = len(df)
-        cagr = cum.iloc[-1] ** (252 / total_days) - 1
-        vol = df["return"].std() * np.sqrt(252)
-        # Sharpe ratio: annualized return divided by annualized volatility
-        if df["return"].std() != 0:
-            sharpe = (df["return"].mean() * 252) / (df["return"].std() * np.sqrt(252))
-        else:
-            sharpe = 0.0
-        running_max = cum.cummax()
-        drawdown = cum / running_max - 1
-        maxdd = drawdown.min()
-        return float(cagr), float(vol), float(sharpe), float(maxdd)
-
-    cagr_t, vol_t, sharpe_t, maxdd_t = calc_metrics(trend_returns)
-    cagr_x, vol_x, sharpe_x, maxdd_x = calc_metrics(xsmom_returns)
+def save_performance_report(perf: Dict[str, object], name: str) -> None:
     os.makedirs("reports", exist_ok=True)
-    pd.DataFrame(
-        [
-            {
-                "strategy": "Trend ETF",
-                "CAGR": cagr_t,
-                "Vol": vol_t,
-                "Sharpe": sharpe_t,
-                "MaxDD": maxdd_t,
-            },
-            {
-                "strategy": "Momentum 12-1",
-                "CAGR": cagr_x,
-                "Vol": vol_x,
-                "Sharpe": sharpe_x,
-                "MaxDD": maxdd_x,
-            },
-        ]
-    ).to_csv("reports/perf_summary.csv", index=False)
-    # save equity curves
-    trend_returns.to_csv("reports/equity_trend.csv")
-    xsmom_returns.to_csv("reports/equity_xsmom.csv")
+    perf["equity_curve"].rename("equity").to_csv(f"reports/equity_{name}.csv")
+    perf["daily_returns"].rename("return").to_csv(f"reports/daily_returns_{name}.csv")
 
 
-def main():
-    # Generate ML signals first so signals.js is up to date
+def main() -> None:
     generate_ml_signals()
-    # Determine lookback period (two years)
-    today = datetime.today().date()
+    today = datetime.now().date()
     start_date = today - timedelta(days=730)
-    end_date = today
-    # Define universes
-    etfs = ["SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "GLD"]
-    largecaps = [
-        "AAPL",
-        "MSFT",
-        "NVDA",
-        "AMZN",
-        "META",
-        "GOOGL",
-        "GOOG",
-        "TSLA",
-        "BRK-B",
-        "JPM",
-        "V",
-        "UNH",
-        "JNJ",
-        "XOM",
-        "PG",
-        "MA",
-        "HD",
-        "ABBV",
-        "MRK",
-        "PEP",
-        "LLY",
-        "BAC",
-        "KO",
-        "AVGO",
-        "PFE",
-        "CSCO",
-        "TMO",
-        "COST",
-        "CVX",
-        "WMT",
-        "ABT",
-        "AMGN",
-        "ACN",
-        "INTC",
-        "QCOM",
-        "MCD",
-        "DHR",
-        "BMY",
-        "TXN",
-        "LOW",
-        "NEE",
-        "ORCL",
-        "LIN",
-        "NKE",
-        "RTX",
-        "UPS",
-        "MMM",
-        "HON",
-        "MS",
-        "GS",
+    etf_universe = ["SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "GLD"]
+    equity_universe = [
+        "AAPL", "MSFT", "NVDA", "AMZN", "META",
+        "GOOGL", "TSLA", "BRK-B", "JPM", "XOM",
     ]
-    # Generate strategy signals
-    trend_signals = generate_trend_signals(etfs, start_date, end_date)
-    xsmom_signals = generate_xsmom_signals(largecaps, start_date, end_date)
-    # Save JS files for front-end
-    save_js("signals_trend.js", "signals_trend", trend_signals)
-    save_js("signals_xsmom.js", "signals_xsmom", xsmom_signals)
-    # Fetch data for performance evaluation
-    data_trend = yf.download(etfs, start=start_date, end=end_date, progress=False)["Adj Close"]
-    data_lc = yf.download(largecaps, start=start_date, end=end_date, progress=False)["Adj Close"]
-    # Compute daily returns for each strategy
-    trend_returns = compute_performance(trend_signals, data_trend)
-    xsmom_returns = compute_performance(xsmom_signals, data_lc)
-    # Save performance summary and equity curves
-    save_performance_report(trend_returns, xsmom_returns)
+    vrp = compute_vrp(start_date, today + timedelta(days=1))
+    trend_signals = generate_trend_signals(etf_universe, start_date, today + timedelta(days=1), vrp)
+    xsmom_signals = generate_xsmom_signals(equity_universe, start_date, today + timedelta(days=1), vrp)
+    save_js(trend_signals, "signals_trend", "signals_trend.js")
+    save_js(xsmom_signals, "signals_xsmom", "signals_xsmom.js")
+    perf_trend = compute_performance(trend_signals)
+    perf_xsmom = compute_performance(xsmom_signals)
+    save_performance_report(perf_trend, "trend")
+    save_performance_report(perf_xsmom, "xsmom")
+    summary = pd.DataFrame([
+        {
+            "strategy": "trend",
+            "CAGR": perf_trend["CAGR"],
+            "Volatility": perf_trend["Volatility"],
+            "Sharpe": perf_trend["Sharpe"],
+            "MaxDD": perf_trend["MaxDD"],
+        },
+        {
+            "strategy": "xsmom",
+            "CAGR": perf_xsmom["CAGR"],
+            "Volatility": perf_xsmom["Volatility"],
+            "Sharpe": perf_xsmom["Sharpe"],
+            "MaxDD": perf_xsmom["MaxDD"],
+        },
+    ])
+    os.makedirs("reports", exist_ok=True)
+    summary.to_csv("reports/perf_summary.csv", index=False)
 
 
 if __name__ == "__main__":
